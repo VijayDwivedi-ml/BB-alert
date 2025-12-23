@@ -1,453 +1,513 @@
 import streamlit as st
-import yfinance as yf
-import pandas as pd
-import numpy as np
-import ta
-import plotly.graph_objs as go
-from plotly.subplots import make_subplots
-from datetime import datetime, timedelta
-import pytz
+import requests
+import re
+import random
+from collections import defaultdict
+import math
 
-# Configure the page settings for full width
-st.set_page_config(
-    page_title="Bollinger Bands Alert System",
-    page_icon="📊",
-    layout="wide",  # Set layout to wide for full-width coverage
-)
-
-
-# Add this after your imports
-st.markdown("""
-<style>
-.alert {
-    padding: 20px;
-    background-color: #4CAF50;
-    color: white;
-    margin-bottom: 15px;
-    opacity: 1;
-    transition: opacity 0.6s;
+# =========================
+# Data sources
+# =========================
+DATASOURCE = {
+    "Ramayana (English)": "https://www.gutenberg.org/files/24869/24869-0.txt",
+    "Mahabharata (English)": "https://www.gutenberg.org/files/15474/15474-0.txt",
+    "Bhagavad Gita (English - Arnold)": "https://www.gutenberg.org/ebooks/2388.txt.utf-8", # Direct text
+    # Or use the main page, which also works:
+    # "Bhagavad Gita (English - Arnold)": "https://www.gutenberg.org/ebooks/2388",
 }
 
-.alert.success {
-    background-color: #4CAF50;
-}
-
-.closebtn {
-    margin-left: 15px;
-    color: white;
-    font-weight: bold;
-    float: right;
-    font-size: 22px;
-    line-height: 20px;
-    cursor: pointer;
-    transition: 0.3s;
-}
-</style>
-""", unsafe_allow_html=True)
-
-# Add this JavaScript for sound
-st.markdown("""
-<script>
-function playAlertSound() {
-    var audio = new Audio('https://actions.google.com/sounds/v1/alarms/beep_short.ogg');
-    audio.play();
-}
-</script>
-""", unsafe_allow_html=True)
 
 
-def load_stock_list(csv_path='assets.csv'):
+# =========================
+# Load & preprocess text
+# =========================
+@st.cache_data
+def load_text(url):
     try:
-        # Read the CSV file
-        df = pd.read_csv(csv_path)
-        
-        # Create a dictionary of assets and tickers
-        stock_dict = dict(zip(df['Asset'], df['ticker']))
-        
-        return {
-            'tickers': df['ticker'].tolist(),
-            'dict': stock_dict
-        }
-    
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        text = response.text.lower()
+        # Keep basic punctuation for better learning
+        text = re.sub(r"[^a-z\s.,!?']", " ", text)
+        text = re.sub(r"\s+", " ", text)
+        words = text.strip().split()
+        return words
     except Exception as e:
-        st.error(f"Error reading CSV: {e}. Using default list.")
-        return {
-            'tickers': ['EURUSD=X', 'INFY.NS', 'GC=F'],
-            'dict': {
-                'EURO': 'EURUSD=X', 
-                'Infosys': 'INFY.NS', 
-                'Gold': 'GC=F'
-            }
-        }
-
-
-def fetch_stock_data(ticker, period, interval):
-    try:
-        # Set timezone to IST
-        ist = pytz.timezone('Asia/Kolkata')
-        
-        # Fetch stock data
-        stock_data = yf.Ticker(ticker)
-        stock_data_hist = stock_data.history(period=period, interval=interval)
-        
-        # If the index is not timezone-aware, localize to UTC first
-        if stock_data_hist.index.tz is None:
-            stock_data_hist.index = stock_data_hist.index.tz_localize('UTC')
-        
-        # Convert to IST
-        stock_data_hist.index = stock_data_hist.index.tz_convert(ist)
-        
-        # Select required columns
-        df = stock_data_hist[['Open', 'Close', 'Low', 'High']]
-        
-        return df
-    
-    except Exception as e:
-        st.error(f"Error fetching data for {ticker}: {e}")
+        st.error(f"Error loading text: {e}")
         return None
 
-def calculate_bollinger_bands(df, timeperiod=20, nbdevup=2, nbdevdn=2):
-    # Initialize Bollinger Bands indicator
-    bollinger = ta.volatility.BollingerBands(
-        close=df['Close'],
-        window=timeperiod,
-        window_dev=nbdevup  # Both up and down standard deviations will use this value
-    )
+# =========================
+# Build Order-3 Markov Chain (TEACHING FOCUS)
+# =========================
+def build_markov_chain_order3(words):
+    """Build a 3-word context Markov model with teaching visualization"""
+    model = defaultdict(lambda: defaultdict(int))
     
-    # Calculate Bollinger Bands
-    df['BB_Upper'] = bollinger.bollinger_hband()
-    df['BB_Middle'] = bollinger.bollinger_mavg()
-    df['BB_Lower'] = bollinger.bollinger_lband()
+    st.write("### 🔍 Building Order-3 Model")
+    st.write(f"Processing {len(words)} words...")
     
-    return df
-
-
-def create_bollinger_count_columns(df):
-    df['count_bullish_lower_break'] = 0
-    df['count_bullish_upper_break'] = 0
-
-    bullish_mask = df['Open'] < df['Close']
-    bearish_mask = df['Open'] > df['Close']
-
-    df.loc[bullish_mask & (df['Close'] < df['BB_Lower']), 'count_bullish_lower_break'] = 1
-    df.loc[bullish_mask & (df['Close'] > df['BB_Upper']), 'count_bullish_upper_break'] = 1
-    df.loc[bearish_mask & (df['Close'] < df['BB_Lower']), 'count_bullish_lower_break'] = 1
-    df.loc[bearish_mask & (df['Close'] > df['BB_Upper']), 'count_bullish_upper_break'] = 1
-
-    total_bullish = df['count_bullish_upper_break'].sum()
-    total_bearish = df['count_bullish_lower_break'].sum()
-
-    alert_message = None
-    if total_bullish > 0 or total_bearish > 0:
-        alert_message = f"""
-        <div class="alert success">
-            <span class="closebtn" onclick="this.parentElement.style.display='none';">&times;</span>
-            🔔 ALERT: {total_bullish} upper breaks, {total_bearish} lower breaks detected!
-        </div>
-        <audio autoplay>
-            <source src="https://actions.google.com/sounds/v1/alarms/beep_short.ogg" type="audio/ogg">
-        </audio>
-        """
-
-    return df, alert_message
-
-
-def create_advanced_bollinger_cumulative_counters_upper(df, break_column):
-    # Create a copy to avoid SettingWithCopyWarning
-    df = df.copy()
+    # Count transitions for teaching statistics
+    total_transitions = 0
+    context_examples = []
     
-    # Initialize cumulative counter columns
-    df['cumulative_upper_band_counter'] = 1
-    
-    # Upper Band Cumulative Counter (only when count_bullish_upper_break = 1)
-    for i in range(len(df) - 1):
-        # Check if current row has upper break
-        if df.loc[df.index[i], 'count_bullish_upper_break'] == 1:
-            # 2 Bullish Candle (Open < Close)
-            if (df.loc[df.index[i], 'Open'] < df.loc[df.index[i], 'Close']) and \
-                (df.loc[df.index[i+1], 'Open'] < df.loc[df.index[i+1], 'Close']) and \
-               (df.loc[df.index[i+1], 'Close'] > df.loc[df.index[i], 'Close']):
-                df.loc[df.index[i+1], 'cumulative_upper_band_counter'] = 1
-            # 1 bullish (Open < Close) and adjacent 1 Bearish Candle (Open > Close)
-            elif (df.loc[df.index[i], 'Open'] < df.loc[df.index[i], 'Close']) and \
-                (df.loc[df.index[i+1], 'Open'] > df.loc[df.index[i+1], 'Close']) and \
-               (df.loc[df.index[i+1], 'Close'] > df.loc[df.index[i], 'Close']):
-                df.loc[df.index[i+1], 'cumulative_upper_band_counter'] = 1
-            # 2 Bearish Candle (Open > Close)
-            elif (df.loc[df.index[i], 'Open'] > df.loc[df.index[i], 'Close']) and \
-                (df.loc[df.index[i+1], 'Open'] > df.loc[df.index[i+1], 'Close']) and \
-                 (df.loc[df.index[i+1], 'Close'] > df.loc[df.index[i], 'Close']):
-                df.loc[df.index[i+1], 'cumulative_upper_band_counter'] = 1
-             # 1 Bearish Candle (Open > Close) and 1 bullish candle ((Open < Close))
-            elif (df.loc[df.index[i], 'Open'] > df.loc[df.index[i], 'Close']) and \
-                (df.loc[df.index[i+1], 'Open'] < df.loc[df.index[i+1], 'Close']) and \
-                 (df.loc[df.index[i+1], 'Close'] > df.loc[df.index[i], 'Close']):
-                df.loc[df.index[i+1], 'cumulative_upper_band_counter'] = 1
-            else:
-                df.loc[df.index[i+1], 'cumulative_upper_band_counter'] = -1
-    
-    # Calculate cumulative sum
-    df['cumulative_upper_band_total'] = df['cumulative_upper_band_counter'].cumsum()
-    
-    return df
-
-def create_advanced_bollinger_cumulative_counters_lower(df, break_column):
-    # Create a copy to avoid SettingWithCopyWarning
-    df = df.copy()
-    
-    # Initialize cumulative counter columns
-    df['cumulative_lower_band_counter'] = 1
-    
-   
-    # Lower Band Cumulative Counter (only when count_bullish_lower_break = 1)
-    for i in range(len(df) - 1):
-        # Check if current row has lower break
-        if df.loc[df.index[i], 'count_bullish_lower_break'] == 1:
-            # 2 Bullish Candle (Open < Close)
-            if (df.loc[df.index[i], 'Open'] < df.loc[df.index[i], 'Close']) and \
-                (df.loc[df.index[i+1], 'Open'] < df.loc[df.index[i+1], 'Close']) and \
-               (df.loc[df.index[i+1], 'Close'] < df.loc[df.index[i], 'Close']):
-                df.loc[df.index[i+1], 'cumulative_lower_band_counter'] = 1
-            # 1 Bullish Candle (Open < Close) and 1 Bearish Candle (Open > Close)
-            elif (df.loc[df.index[i], 'Open'] < df.loc[df.index[i], 'Close']) and \
-                (df.loc[df.index[i+1], 'Open'] > df.loc[df.index[i+1], 'Close']) and \
-               (df.loc[df.index[i+1], 'Close'] < df.loc[df.index[i], 'Close']):
-                df.loc[df.index[i+1], 'cumulative_lower_band_counter'] = 1
-            # 2 Bearish Candle (Open > Close)
-            elif (df.loc[df.index[i], 'Open'] > df.loc[df.index[i], 'Close']) and \
-                (df.loc[df.index[i+1], 'Open'] > df.loc[df.index[i+1], 'Close']) and \
-                 (df.loc[df.index[i+1], 'Close'] < df.loc[df.index[i], 'Close']):
-                df.loc[df.index[i+1], 'cumulative_lower_band_counter'] = 1
-            # 1 Bearish Candle (Open > Close) and 1 Bullish Candle (Open < Close)
-            elif (df.loc[df.index[i], 'Open'] > df.loc[df.index[i], 'Close']) and \
-                (df.loc[df.index[i+1], 'Open'] < df.loc[df.index[i+1], 'Close']) and \
-                 (df.loc[df.index[i+1], 'Close'] < df.loc[df.index[i], 'Close']):
-                df.loc[df.index[i+1], 'cumulative_lower_band_counter'] = 1
-            else:
-                df.loc[df.index[i+1], 'cumulative_lower_band_counter'] = -1
-    
-    # Calculate cumulative sum
-    df['cumulative_lower_band_total'] = df['cumulative_lower_band_counter'].cumsum()
-    
-    return df
-
-def create_reversal_report(df, ticker, interval):
-    upper_breaks = df[df['count_bullish_upper_break'] == 1]
-    lower_breaks = df[df['count_bullish_lower_break'] == 1]
-    
-    report_data = []
-    
-    # Process upper breaks
-    for idx, row in upper_breaks.iterrows():
-        idx = pd.to_datetime(idx)  # Ensure idx is a datetime object
-        cumulative_count = row.get('cumulative_upper_band_total', None)
-        if cumulative_count is not None:  # Only add if there's a cumulative count
-            report_data.append({
-                'Pair': ticker,
-                'Direction': 'Up',
-                'Time Frame/Interval': interval,
-                'Cumulative Count': cumulative_count,
-                'Time': idx.strftime('%H:%M'),
-                'Date': idx.strftime('%B %d, %Y'),
-                'Price': row['Close'],
-                'Timestamp': idx  # Add full timestamp for sorting
-            })
-    
-    # Process lower breaks
-    for idx, row in lower_breaks.iterrows():
-        idx = pd.to_datetime(idx)  # Ensure idx is a datetime object
-        cumulative_count = row.get('cumulative_lower_band_total', None)
-        if cumulative_count is not None:  # Only add if there's a cumulative count
-            report_data.append({
-                'Pair': ticker,
-                'Direction': 'Down',
-                'Time Frame/Interval': interval,
-                'Cumulative Count': cumulative_count,
-                'Time': idx.strftime('%H:%M'),
-                'Date': idx.strftime('%B %d, %Y'),
-                'Price': row['Close'],
-                'Timestamp': idx  # Add full timestamp for sorting
-            })
-    
-    # Convert to DataFrame
-    reversal_report = pd.DataFrame(report_data)
-    
-    if not reversal_report.empty:
-        # Sort by timestamp and get the highest cumulative count for each timestamp
-        reversal_report = (reversal_report.sort_values('Cumulative Count', ascending=False)
-                         .drop_duplicates(subset=['Time', 'Direction'], keep='first')
-                         .sort_values('Timestamp'))
-    
-    # Drop the Timestamp column before displaying
-    if not reversal_report.empty:
-        reversal_report = reversal_report.drop(columns=['Timestamp'])
-    
-    return reversal_report
-
-
-def advanced_bollinger_cumulative_plot(df):
-    fig = make_subplots(
-        rows=3, 
-        cols=1, 
-        shared_xaxes=True, 
-        vertical_spacing=0.03,
-        subplot_titles=(
-            'Candlestick with Bollinger Bands', 
-            'Upper Band Cumulative Counter', 
-            'Lower Band Cumulative Counter'
-        ),
-        row_heights=[0.5, 0.25, 0.25]
-    )
-
-    # Candlestick
-    candlestick = go.Candlestick(
-        x=df.index,
-        open=df['Open'],
-        high=df['High'],
-        low=df['Low'],
-        close=df['Close'],
-        name='Candlestick'
-    )
-    fig.add_trace(candlestick, row=1, col=1)
-
-    # Bollinger Bands
-    upper_band = go.Scatter(
-        x=df.index, 
-        y=df['BB_Upper'], 
-        mode='lines', 
-        name='Upper Band',
-        line=dict(color='green', width=1)
-    )
-    fig.add_trace(upper_band, row=1, col=1)
-
-    lower_band = go.Scatter(
-        x=df.index, 
-        y=df['BB_Lower'], 
-        mode='lines', 
-        name='Lower Band',
-        line=dict(color='green', width=1)
-    )
-    fig.add_trace(lower_band, row=1, col=1)
-
-    # Upper Band Cumulative Counter
-    upper_break_df = df[df['count_bullish_upper_break'] == 1]
-    upper_counter = go.Scatter(
-        x=upper_break_df.index,
-        y=upper_break_df['cumulative_upper_band_total'],
-        mode='markers',
-        name='Upper Band Cumulative Total',
-        line=dict(color='blue', width=2),
-        marker=dict(color='blue', size=8)
-    )
-    fig.add_trace(upper_counter, row=2, col=1)
-
-    # Lower Band Cumulative Counter
-    lower_break_df = df[df['count_bullish_lower_break'] == 1]
-    lower_counter = go.Scatter(
-        x=lower_break_df.index,
-        y=lower_break_df['cumulative_lower_band_total'],
-        mode='markers',
-        name='Lower Band Cumulative Total',
-        line=dict(color='red', width=2),
-        marker=dict(color='red', size=8)
-    )
-    fig.add_trace(lower_counter, row=3, col=1)
-
-    # Update layout
-    fig.update_layout(
-        title='Advanced Bollinger Bands Cumulative Counters',
-        height=1000,
-        xaxis_rangeslider_visible=False,
-        legend=dict(
-            orientation="h",
-            yanchor="bottom",
-            y=1.02,
-            xanchor="right",
-            x=1
-        )
-    )
-
-    # Update y-axis titles
-    fig.update_yaxes(title_text="Price", row=1, col=1)
-    fig.update_yaxes(title_text="Upper Band Counter", row=2, col=1)
-    fig.update_yaxes(title_text="Lower Band Counter", row=3, col=1)
-
-    return fig
-
-def main():
-    st.title("Bollinger Bands Alert Analysis")
-    
-    # Load stock list
-    stock_data = load_stock_list()
-    
-    # Sidebar for stock and period selection
-    st.sidebar.header("Analysis Parameters")
-    
-    # Stock Selection
-    selected_asset = st.sidebar.selectbox("Select Asset", list(stock_data['dict'].keys()))
-    selected_stock = stock_data['dict'][selected_asset]
-
-    # Define available intervals for 5 days period
-    interval_options = ['1m', '5m', '15m', '30m', '60m', '4h', '1d']
-
-    # Fixed period (not shown in sidebar)
-    selected_period = '5d'
-
-    # Interval Selection
-    selected_interval = st.sidebar.selectbox("Select Interval", interval_options)
-
-    # Fetch and Process Data
-    try:
-        df = fetch_stock_data(selected_stock, selected_period, selected_interval)
+    for i in range(len(words) - 3):
+        context = (words[i], words[i + 1], words[i + 2])
+        next_word = words[i + 3]
+        model[context][next_word] += 1
+        total_transitions += 1
         
-        if df is not None and not df.empty:
-            # Calculate Bollinger Bands
-            df = calculate_bollinger_bands(df)
-            
-            # Create Bollinger Break Columns
-            #df = create_bollinger_count_columns(df)
-            df, alert_message = create_bollinger_count_columns(df)
-
-            if alert_message:
-                st.markdown(alert_message, unsafe_allow_html=True)
-                       
-            # Separate Upper and Lower Break DataFrames
-            df_upper = df[df['count_bullish_upper_break'] == 1]
-            df_lower = df[df['count_bullish_lower_break'] == 1]
-            
-            # Calculate Cumulative Counters
-            df_upper = create_advanced_bollinger_cumulative_counters_upper(df_upper, 'count_bullish_upper_break')
-            df_lower = create_advanced_bollinger_cumulative_counters_lower(df_lower, 'count_bullish_lower_break')
-            
-            # Combine DataFrames
-            df_final = pd.concat([df, df_upper, df_lower])
-            df_final = df_final.sort_index()
-            
-            # Plot Cumulative Bollinger Bands
-            fig = advanced_bollinger_cumulative_plot(df_final)
-            st.plotly_chart(fig)
-            
-            # Create Reversal Report (now sorted by time)
-            reversal_report = create_reversal_report(df_final, selected_stock, selected_interval)
-            
-            # Display Reversal Report
-            st.subheader("Alert")
-            st.dataframe(reversal_report)
-            
-            # Download Button for Reversal Report
-            csv = reversal_report.to_csv(index=False)
-            st.download_button(
-                label="Download Report",
-                data=csv,
-                file_name=f'{selected_stock}_report.csv',
-                mime='text/csv'
-            )
-        else:
-            st.warning("No data available for the selected parameters.")
+        # Collect examples for teaching
+        if len(context_examples) < 5 and context not in [c[0] for c in context_examples]:
+            context_examples.append((context, next_word))
     
-    except Exception as e:
-        st.error(f"An error occurred: {e}")
+    # Convert counts to probabilities
+    prob_model = {}
+    for context, next_words in model.items():
+        total = sum(next_words.values())
+        prob_model[context] = {
+            w: c / total for w, c in next_words.items()
+        }
+    
+    # Teaching display
+    st.success(f"✅ Model built with {len(model):,} unique 3-word contexts")
+    st.info(f"📊 {total_transitions:,} total transitions learned")
+    
+    # Show examples for teaching
+    st.write("### 🧪 Learning Examples")
+    st.write("The model learned patterns like:")
+    for i, (context, next_word) in enumerate(context_examples[:3]):
+        context_str = " ".join(context)
+        st.code(f'Context: "{context_str}" → Next: "{next_word}"')
+    
+    return prob_model
 
+# =========================
+# Temperature scaling (TEACHING VERSION)
+# =========================
+def apply_temperature_with_explanation(probs, temperature):
+    """Apply temperature with visual explanation"""
+    if temperature <= 0.01:
+        # Deterministic choice - teaching mode
+        max_idx = probs.index(max(probs))
+        result = [0.0] * len(probs)
+        result[max_idx] = 1.0
+        return result, "Deterministic (always picks highest probability)"
+    
+    # Apply temperature
+    scaled = []
+    explanation = []
+    
+    for p in probs:
+        # Avoid log(0)
+        p_safe = max(p, 1e-10)
+        # Apply temperature
+        scaled_p = math.exp(math.log(p_safe) / temperature)
+        scaled.append(scaled_p)
+        explanation.append(f"{p:.3f} → {scaled_p:.3f}")
+    
+    total = sum(scaled)
+    normalized = [p / total for p in scaled]
+    
+    # Generate explanation
+    expl_text = f"Temperature {temperature:.1f} applied:\n"
+    expl_text += f"Before: {[f'{p:.3f}' for p in probs]}\n"
+    expl_text += f"After:  {[f'{p:.3f}' for p in normalized]}"
+    
+    return normalized, expl_text
 
-if __name__ == "__main__":
-    main()
+# =========================
+# Find best context for starting phrase
+# =========================
+def find_starting_context(phrase, model):
+    """Find the best context for a starting phrase (TEACHING FOCUS)"""
+    words = phrase.lower().strip().split()
+    
+    if len(words) < 3:
+        st.warning(f"⚠️  Starting phrase '{phrase}' has {len(words)} words")
+        st.write("For Order-3 model, we need at least 3 words for context.")
+        st.write("Please enter at least 3 words, or we'll use a random start.")
+        return None
+    
+    # Try exact 3-word match from end
+    context = tuple(words[-3:])
+    if context in model:
+        st.success(f"✅ Perfect match found: {' '.join(context)}")
+        return context
+    
+    # Teaching: Show why we didn't find exact match
+    st.warning(f"⚠️  Exact context {' '.join(context)} not found in training data")
+    
+    # Try to find any matching 3-gram in the phrase
+    for i in range(len(words) - 3, -1, -1):
+        test_context = tuple(words[i:i+3])
+        if test_context in model:
+            st.info(f"📌 Using alternative context from phrase: {' '.join(test_context)}")
+            return test_context
+    
+    # No match found in phrase
+    st.warning("🔍 No 3-word sequence from your phrase found in training data")
+    st.write("Using a random context from the model instead.")
+    return None
+
+# =========================
+# Generate text with enhanced teaching explanations
+# =========================
+def generate_text_with_teaching(model, start_phrase, n_words, temperature):
+    """Generate text with step-by-step teaching explanations"""
+    
+    # Get all contexts for fallback
+    contexts = list(model.keys())
+    
+    # Find starting context
+    start_context = find_starting_context(start_phrase, model)
+    
+    if start_context is None:
+        st.info("🎲 Selecting random starting context from model...")
+        start_context = random.choice(contexts)
+        st.code(f"Random start: {' '.join(start_context)}")
+    else:
+        # Verify we start with user's phrase
+        start_phrase_words = start_phrase.lower().strip().split()
+        last_three = ' '.join(start_phrase_words[-3:])
+        if ' '.join(start_context) != last_three:
+            st.info(f"📝 Using: {' '.join(start_context)} (from your phrase)")
+    
+    w1, w2, w3 = start_context
+    generated = [w1, w2, w3]
+    steps = []
+    
+    # Teaching: Show initial state
+    st.write("---")
+    st.write("### 🔄 Generation Process")
+    
+    # Generate words
+    for step in range(n_words):
+        context = (w1, w2, w3)
+        
+        # Handle unknown context
+        if context not in model:
+            st.warning(f"⚠️  Context '{w1} {w2} {w3}' not found in model!")
+            st.write("This happens when the specific 3-word sequence wasn't in the training data.")
+            st.write("Falling back to random context...")
+            context = random.choice(contexts)
+            w1, w2, w3 = context
+        
+        # Get candidates and probabilities
+        candidates = list(model[context].items())
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        
+        # Teaching: Show top candidates
+        words, probs = zip(*candidates)
+        
+        # Apply temperature with explanation
+        adjusted_probs, temp_explanation = apply_temperature_with_explanation(probs, temperature)
+        
+        # Choose next word
+        chosen_idx = random.choices(range(len(words)), adjusted_probs)[0]
+        chosen_word = words[chosen_idx]
+        
+        # Store step information for teaching
+        step_info = {
+            "context": f"{w1} {w2} {w3}",
+            "top_candidates": list(zip(words[:5], probs[:5], adjusted_probs[:5])),
+            "chosen": chosen_word,
+            "chosen_prob": probs[chosen_idx],
+            "temperature_explanation": temp_explanation,
+            "step": step + 1
+        }
+        steps.append(step_info)
+        
+        # Update generated text and context
+        generated.append(chosen_word)
+        w1, w2, w3 = w2, w3, chosen_word
+    
+    return " ".join(generated), steps
+
+# =========================
+# Compare Order-2 vs Order-3 (TEACHING FOCUS)
+# =========================
+def build_comparison_models(words):
+    """Build both Order-2 and Order-3 models for teaching comparison"""
+    st.write("## 🔬 Model Comparison: Order-2 vs Order-3")
+    
+    # Build Order-2 model
+    st.write("### 📐 Building Order-2 Model")
+    model_order2 = defaultdict(lambda: defaultdict(int))
+    for i in range(len(words) - 2):
+        context = (words[i], words[i + 1])
+        next_word = words[i + 2]
+        model_order2[context][next_word] += 1
+    
+    # Convert to probabilities
+    prob_model2 = {}
+    for context, next_words in model_order2.items():
+        total = sum(next_words.values())
+        prob_model2[context] = {w: c/total for w, c in next_words.items()}
+    
+    # Build Order-3 model
+    st.write("### 📏 Building Order-3 Model")
+    model_order3 = defaultdict(lambda: defaultdict(int))
+    for i in range(len(words) - 3):
+        context = (words[i], words[i + 1], words[i + 2])
+        next_word = words[i + 3]
+        model_order3[context][next_word] += 1
+    
+    # Convert to probabilities
+    prob_model3 = {}
+    for context, next_words in model_order3.items():
+        total = sum(next_words.values())
+        prob_model3[context] = {w: c/total for w, c in next_words.items()}
+    
+    # Teaching comparison
+    st.success("✅ Both models built successfully!")
+    
+    comparison_data = {
+        "order2": {
+            "name": "Order-2 (2-word context)",
+            "contexts": len(prob_model2),
+            "example": next(iter(prob_model2.items())) if prob_model2 else None,
+            "model": prob_model2
+        },
+        "order3": {
+            "name": "Order-3 (3-word context)",
+            "contexts": len(prob_model3),
+            "example": next(iter(prob_model3.items())) if prob_model3 else None,
+            "model": prob_model3
+        }
+    }
+    
+    # Display comparison
+    st.write("### 📊 Model Statistics")
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.metric("Order-2 Contexts", f"{comparison_data['order2']['contexts']:,}")
+        if comparison_data['order2']['example']:
+            ctx, probs = comparison_data['order2']['example']
+            st.caption(f"Example: {' '.join(ctx)} → {list(probs.keys())[0]} ({list(probs.values())[0]:.2%})")
+    
+    with col2:
+        st.metric("Order-3 Contexts", f"{comparison_data['order3']['contexts']:,}")
+        if comparison_data['order3']['example']:
+            ctx, probs = comparison_data['order3']['example']
+            st.caption(f"Example: {' '.join(ctx)} → {list(probs.keys())[0]} ({list(probs.values())[0]:.2%})")
+    
+    # Teaching insight
+    st.info("""
+    **🎓 Teaching Insight**: 
+    - **Order-2**: Simpler, faster, but less context
+    - **Order-3**: More accurate, better coherence, but needs more data
+    - Each additional word in context exponentially increases prediction quality
+    """)
+    
+    return comparison_data
+
+# =========================
+# Streamlit UI - TEACHING FOCUS
+# =========================
+st.set_page_config(page_title="Markov Model Teaching Lab", layout="wide")
+st.title("🎓 Markov Model Teaching Lab: Order-3 Edition")
+st.caption("Learn how language models work by building a 3-word context Markov chain")
+
+# Sidebar controls
+st.sidebar.header("🎛️ Controls")
+
+book = st.sidebar.selectbox("Select Training Text", DATASOURCE.keys())
+start_phrase = st.sidebar.text_input(
+    "Starting phrase (min 3 words)", 
+    value="lord rama said to",
+    help="Enter at least 3 words for Order-3 context"
+)
+num_words = st.sidebar.slider("Words to generate", 10, 100, 30)
+temperature = st.sidebar.slider(
+    "Temperature", 0.0, 2.0, 1.0, 0.1,
+    help="0 = deterministic, 1 = original probabilities, 2 = more random"
+)
+
+# Teaching mode toggle
+teaching_mode = st.sidebar.checkbox("📚 Detailed Teaching Mode", value=True)
+
+# Generate button
+if st.sidebar.button("🚀 Generate & Learn"):
+    
+    # Load text
+    with st.spinner("📥 Loading text..."):
+        words = load_text(DATASOURCE[book])
+        if words is None:
+            st.error("Failed to load text. Please try again.")
+            st.stop()
+    
+    # Build and compare models
+    comparison = build_comparison_models(words)
+    
+    st.write("---")
+    st.write("## 🎯 Order-3 Generation (Main Model)")
+    
+    # Generate text with Order-3 model
+    with st.spinner("🧠 Generating text with Order-3 model..."):
+        text, steps = generate_text_with_teaching(
+            comparison["order3"]["model"], 
+            start_phrase, 
+            num_words, 
+            temperature
+        )
+    
+    # Display results
+    st.subheader("📝 Generated Text (Order-3)")
+    st.markdown(f'<div style="background-color: #f0f2f6; padding: 20px; border-radius: 10px; border-left: 5px solid #4CAF50;">{text}</div>', 
+                unsafe_allow_html=True)
+    
+    # Display step-by-step teaching
+    if teaching_mode and steps:
+        st.write("---")
+        st.subheader("🔍 Step-by-Step Teaching")
+        
+        # Let user navigate through steps
+        step_to_show = st.selectbox(
+            "Select step to examine",
+            range(1, min(11, len(steps) + 1)),
+            format_func=lambda x: f"Step {x}: Context → Word"
+        )
+        
+        if step_to_show <= len(steps):
+            step = steps[step_to_show - 1]
+            
+            st.write(f"### Step {step_to_show}")
+            
+            # Context box
+            st.markdown(f"""
+            **Previous 3-word context:**  
+            `{step['context']}`
+            """)
+            
+            # Top candidates
+            st.write("**Top 5 candidate next words:**")
+            for word, orig_prob, adj_prob in step["top_candidates"][:5]:
+                col1, col2, col3 = st.columns([3, 2, 2])
+                with col1:
+                    st.write(f"`{word}`")
+                with col2:
+                    st.write(f"Orig: {orig_prob:.3f}")
+                with col3:
+                    st.write(f"Adj: {adj_prob:.3f}")
+            
+            # Temperature explanation
+            if temperature != 1.0:
+                with st.expander("🧪 Temperature Effect"):
+                    st.text(step["temperature_explanation"])
+            
+            # Chosen word
+            st.success(f"""
+            **✅ Selected word:** `{step['chosen']}`  
+            **Probability:** {step['chosen_prob']:.3f}
+            """)
+            
+            # Teaching insight
+            st.info(f"""
+            **🎓 Teaching Moment:**  
+            The model looked at the last 3 words `{step['context']}` and chose 
+            `{step['chosen']}` as the most likely next word based on patterns 
+            learned from the training text.
+            """)
+    
+    # Show simple comparison with Order-2
+    st.write("---")
+    st.subheader("⚖️ Quick Comparison: Order-2 vs Order-3")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.write("**Order-2 Output**")
+        # Generate quick Order-2 sample
+        model2 = comparison["order2"]["model"]
+        if start_phrase:
+            start_words = tuple(start_phrase.lower().split()[-2:])
+            if start_words in model2:
+                # Simple Order-2 generation
+                generated = list(start_words)
+                w1, w2 = start_words
+                for _ in range(10):  # Just first 10 words for comparison
+                    context = (w1, w2)
+                    if context in model2:
+                        candidates = list(model2[context].items())
+                        if candidates:
+                            chosen = random.choices(
+                                [w for w, _ in candidates],
+                                [p for _, p in candidates]
+                            )[0]
+                            generated.append(chosen)
+                            w1, w2 = w2, chosen
+                
+                st.code(' '.join(generated[:15]) + "...")
+    
+    with col2:
+        st.write("**Order-3 Output**")
+        st.code(text[:100] + "...")
+    
+    # Final teaching summary
+    st.write("---")
+    st.subheader("📚 Learning Summary")
+    
+    st.markdown("""
+    ### What you learned today:
+    
+    1. **Order-3 Markov Models** use 3-word contexts for prediction
+    2. **Context matters**: More context = better coherence
+    3. **Temperature control**: Adjusts randomness of predictions
+    4. **Training data**: The model learns from patterns in the text
+    5. **Limitations**: Can't generate truly novel ideas, only recombine learned patterns
+    
+    ### Try experimenting with:
+    - Different starting phrases
+    - Temperature = 0 (deterministic) vs 2 (very creative)
+    - Different source texts
+    """)
+
+# Initial teaching content
+else:
+    st.write("## 🎓 Welcome to the Markov Model Teaching Lab!")
+    
+    st.markdown("""
+    ### 👨‍🏫 What you'll learn:
+    
+    **1. What is a Markov Chain?**
+    - A simple statistical model that predicts the next item based only on the current state
+    - In language: predicts next word based on previous words
+    
+    **2. Order-3 vs Order-2: What's the difference?**
+    
+    | Order | Context | Example | Accuracy |
+    |-------|---------|---------|----------|
+    | Order-2 | Last 2 words | "rama went" → "to" | Basic |
+    | Order-3 | Last 3 words | "lord rama went" → "to" | Better! |
+    
+    **3. Key Concepts:**
+    - **Context Window**: How many previous words the model considers
+    - **Probability Distribution**: For each context, a list of possible next words with probabilities
+    - **Temperature**: Controls randomness vs determinism
+    
+    ### 🎯 Today's Goal:
+    Understand how adding more context (Order-3) improves text generation compared to simpler models.
+    
+    ### 🚀 Get Started:
+    1. Select a training text
+    2. Enter a starting phrase (at least 3 words)
+    3. Adjust temperature if desired
+    4. Click **"Generate & Learn"** in the sidebar
+    """)
+    
+    # Quick example
+    st.write("### 💡 Quick Example")
+    st.code("""
+    Training: "the cat sat on the mat. the cat slept."
+    
+    Order-2 learns:
+    "the cat" → sat (50%), slept (50%)
+    
+    Order-3 learns:
+    "the cat sat" → on (100%)
+    "cat sat on" → the (100%)
+    "sat on the" → mat (100%)
+    
+    Better context = better predictions!
+    """)
